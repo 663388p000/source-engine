@@ -3531,7 +3531,7 @@ void CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
 		}
 
 		ASTCEncodeResult astcResult = {};
-		ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, rgbaSrc, width, height,
+		ASTC_CompressTextureRequired( /*isHDR=*/false, srgb, /*forceOpaque=*/!hasAlpha, rgbaSrc, width, height,
 									   GL_RGBA, GL_UNSIGNED_BYTE, &astcResult );
 
 		gGL->glCompressedTexImage2D( target, level, (GLenum)astcResult.m_glInternalFormat,
@@ -3786,9 +3786,10 @@ void CGLMTex::WriteTexels( GLMTexLockDesc *desc, bool writeWholeSlice, bool noDa
 					{
 						bool isHDR = ASTC_IsHDRFormat( (int)m_layout->m_key.m_texFormat );
 						bool isSRGB = ( format->m_glIntFormatSRGB != format->m_glIntFormat ) && ( intformat == format->m_glIntFormatSRGB );
+						bool forceOpaque = !ASTC_FormatHasAlpha( (int)m_layout->m_key.m_texFormat );
 
 						ASTCEncodeResult astcResult = {};
-						ASTC_CompressTextureRequired( isHDR, isSRGB, sliceAddress, slice->m_xSize, slice->m_ySize,
+						ASTC_CompressTextureRequired( isHDR, isSRGB, forceOpaque, sliceAddress, slice->m_xSize, slice->m_ySize,
 													   glDataFormat, glDataType, &astcResult );
 
 						// http://www.opengl.org/sdk/docs/man/xhtml/glCompressedTexImage2D.xml
