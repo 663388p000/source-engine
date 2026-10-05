@@ -126,6 +126,13 @@ bool ASTC_IsEligibleFormat( int d3dFormat );
 // therefore must be encoded with the ASTC HDR profile instead of LDR.
 bool ASTC_IsHDRFormat( int d3dFormat );
 
+// Returns false for the "X" (no-alpha) D3DFORMATs -- X8R8G8B8, X1R5G5B5,
+// R5G6B5, R8G8B8, L8, R32F -- and true for everything else. Callers pass
+// the inverse of this as ASTC_CompressTextureRequired()'s forceOpaque so
+// formats with no real alpha channel don't encode whatever garbage bits
+// happen to be sitting in the unused channel.
+bool ASTC_FormatHasAlpha( int d3dFormat );
+
 // Encodes an RGBA (or RGBA-compatible) source image into ASTC blocks.
 //   srcData        - tightly packed source texels, top row first
 //   width, height  - texel dimensions (need not be a multiple of the block size;
@@ -133,6 +140,11 @@ bool ASTC_IsHDRFormat( int d3dFormat );
 //   srcGLFormat    - GL_RGBA, GL_BGRA, GL_RGB, ... describing srcData's channel order
 //   srcGLType      - GL_UNSIGNED_BYTE, GL_UNSIGNED_INT_8_8_8_8_REV, GL_HALF_FLOAT_ARB, GL_FLOAT, ...
 //   isHDR          - from ASTC_IsHDRFormat()
+//   isSRGB         - true if the source should decode with an sRGB gamma curve
+//                    (ignored when isHDR is true -- sRGB is an LDR-only concept)
+//   forceOpaque    - true to force alpha to fully opaque while converting the
+//                    source to RGBA, regardless of the source alpha channel;
+//                    see ASTC_FormatHasAlpha() above
 //   blockW, blockH - ASTC block footprint, e.g. 4,4 (highest quality/least
 //                    compression) up to 12,12 (most compression). This
 //                    tree's defaults are 6x6 for LDR and 4x4 for HDR (see
@@ -153,6 +165,8 @@ bool ASTC_CompressTexture(
 	unsigned int srcGLFormat,
 	unsigned int srcGLType,
 	bool isHDR,
+	bool isSRGB,
+	bool forceOpaque,
 	int blockW,
 	int blockH,
 	int qualityPreset,
@@ -174,9 +188,15 @@ bool ASTC_CompressTexture(
 //   isSRGB  - true if the source should decode with an sRGB gamma curve.
 //             Ignored when isHDR is true (sRGB is an LDR-only concept --
 //             see the GL_COMPRESSED_SRGB8_ALPHA8_ASTC_* enums above).
+//   forceOpaque - true to force alpha to fully opaque instead of using
+//             whatever's in the source's alpha channel. Pass
+//             !ASTC_FormatHasAlpha(d3dFormat) for a format-driven caller,
+//             or compute it from local context (e.g. an already-decoded
+//             DXT1-no-alpha buffer) like cglmtex.cpp does.
 void ASTC_CompressTextureRequired(
 	bool isHDR,
 	bool isSRGB,
+	bool forceOpaque,
 	const void* srcData,
 	int width,
 	int height,
