@@ -25,7 +25,20 @@
 	#include <thread>
 	#include <vector>
 #endif
-
+#ifndef D3DFMT_A8R8G8B8
+	#define D3DFMT_A8R8G8B8      21
+	#define D3DFMT_X8R8G8B8      22
+	#define D3DFMT_A4R4G4B4      26
+	#define D3DFMT_A1R5G5B5      25
+	#define D3DFMT_X1R5G5B5      24
+	#define D3DFMT_A2R10G10B10   35
+	#define D3DFMT_A2B10G10R10   31
+	#define D3DFMT_Q8W8V8U8      63
+	#define D3DFMT_A16B16G16R16   36
+	#define D3DFMT_A16B16G16R16F 113
+	#define D3DFMT_A32B32G32R32F 116
+	#define D3DFMT_R32F          114
+#endif
 // ---------------------------------------------------------------------------
 // GL enums used to describe the *source* pixel layout. Individually guarded so
 // this file works with or without the real GL headers in front of it.
@@ -138,23 +151,23 @@ bool ASTC_IsEligibleFormat( int d3dFormat )
 {
 	switch ( d3dFormat )
 	{
-		case ASTC_D3DFMT_R8G8B8:
-		case ASTC_D3DFMT_A8R8G8B8:
-		case ASTC_D3DFMT_X8R8G8B8:
-		case ASTC_D3DFMT_R5G6B5:
-		case ASTC_D3DFMT_X1R5G5B5:
-		case ASTC_D3DFMT_A1R5G5B5:
-		case ASTC_D3DFMT_A4R4G4B4:
-		case ASTC_D3DFMT_A8:
-		case ASTC_D3DFMT_A2B10G10R10:
-		case ASTC_D3DFMT_A2R10G10B10:
-		case ASTC_D3DFMT_A16B16G16R16:
-		case ASTC_D3DFMT_L8:
-		case ASTC_D3DFMT_A8L8:
-		case ASTC_D3DFMT_Q8W8V8U8:		// straight RGBA-shaped bytes (shader does the scale/bias)
-		case ASTC_D3DFMT_A16B16G16R16F:
-		case ASTC_D3DFMT_R32F:
-		case ASTC_D3DFMT_A32B32G32R32F:
+		case D3DFMT_R8G8B8:
+		case D3DFMT_A8R8G8B8:
+		case D3DFMT_X8R8G8B8:
+		case D3DFMT_R5G6B5:
+		case D3DFMT_X1R5G5B5:
+		case D3DFMT_A1R5G5B5:
+		case D3DFMT_A4R4G4B4:
+		case D3DFMT_A8:
+		case D3DFMT_A2B10G10R10:
+		case D3DFMT_A2R10G10B10:
+		case D3DFMT_A16B16G16R16:
+		case D3DFMT_L8:
+		case D3DFMT_A8L8:
+		case D3DFMT_Q8W8V8U8:		// straight RGBA-shaped bytes (shader does the scale/bias)
+		case D3DFMT_A16B16G16R16F:
+		case D3DFMT_R32F:
+		case D3DFMT_A32B32G32R32F:
 			return true;
 		default:
 			return false;
@@ -165,9 +178,9 @@ bool ASTC_IsHDRFormat( int d3dFormat )
 {
 	switch ( d3dFormat )
 	{
-		case ASTC_D3DFMT_A16B16G16R16F:
-		case ASTC_D3DFMT_A32B32G32R32F:
-		case ASTC_D3DFMT_R32F:
+		case D3DFMT_A16B16G16R16F:
+		case D3DFMT_A32B32G32R32F:
+		case D3DFMT_R32F:
 			return true;
 		default:
 			return false;	// everything else is a normalized ("byte-ish") format -> LDR
@@ -178,12 +191,12 @@ bool ASTC_FormatHasAlpha( int d3dFormat )
 {
 	switch ( d3dFormat )
 	{
-		case ASTC_D3DFMT_X8R8G8B8:
-		case ASTC_D3DFMT_X1R5G5B5:
-		case ASTC_D3DFMT_R5G6B5:
-		case ASTC_D3DFMT_R8G8B8:
-		case ASTC_D3DFMT_L8:
-		case ASTC_D3DFMT_R32F:
+		case D3DFMT_X8R8G8B8:
+		case D3DFMT_X1R5G5B5:
+		case D3DFMT_R5G6B5:
+		case D3DFMT_R8G8B8:
+		case D3DFMT_L8:
+		case D3DFMT_R32F:
 			return false;
 		default:
 			return true;
