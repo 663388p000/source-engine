@@ -1,0 +1,59 @@
+name: Builds
+
+on:
+jobs:
+  builds-android:
+    name: Build android-aarch64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source (shallow clone)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Prepare dependencies + fetch tags
+        run: |
+          sudo apt update -y
+          sudo apt install -y \
+            astcenc \
+            libastcenc-dev
+
+      - name: Build android-aarch64
+        run: |
+          bash scripts/build-android-arm64.sh
+
+      - name: Collect ARM64 libraries
+        run: |
+          set -e
+
+          mkdir -p output/arm64-v8a
+
+          libraries=(
+            libtogl.so
+          )
+
+          for lib in "${libraries[@]}"; do
+            found="$(find . -type f -name "$lib" -print -quit)"
+
+            if [ -n "$found" ]; then
+              echo "Found: $found"
+              cp "$found" "output/arm64-v8a/$lib"
+            else
+              echo "::warning::Not found: $lib"
+            fi
+          done
+
+          echo
+          echo "Collected libraries:"
+          ls -lh output/arm64-v8a
+
+          cd output
+          zip -r csso-android-aarch64.zip arm64-v8a
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: csso-android-aarch64
+          path: output/csso-android-aarch64.zip
