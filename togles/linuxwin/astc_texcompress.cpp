@@ -1,16 +1,14 @@
-//========= ASTC runtime recompression feature (added on top of Valve TOGL) =====//
+//========= ASTC runtime recompression (added on top of Valve TOGL) - v2 =======//
 //
 // astc_texcompress.cpp
 //
-// See astc_texcompress.h for the feature overview. This file:
-//   1. classifies D3DFORMATs into "eligible for ASTC" / "LDR" / "HDR" / "has alpha"
-//   2. converts whatever GL (format,type) the caller has in memory into the
-//      plain RGBA8 (LDR) / RGBA float (HDR) buffer astcenc wants. This part is
-//      always compiled (no astcenc needed), so it can be unit tested.
-//   3. calls into ARM's astcenc (HAVE_ASTCENC) to produce real ASTC blocks,
-//      choosing ASTCENC_PRF_LDR / LDR_SRGB / HDR, with a per-thread context
-//      cache and optional multi-threaded encoding
-//   4. builds solid-color "blank" ASTC images without the encoder
+// See astc_texcompress.h for the overview. This file:
+//   1. classifies D3DFORMATs (eligible / LDR / HDR / has-alpha)
+//   2. normalizes the caller's (GL format, type) into what astcenc wants,
+//      with zero-copy handling for 8-bit BGRA/RGBA sources
+//   3. runs astcenc on a persistent thread pool with shared contexts
+//   4. reads and writes the on-disk encode cache
+//   5. builds solid-color blank ASTC images without the encoder
 //
 //===============================================================================
 
@@ -18,12 +16,24 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include "tier0/dbg.h"	// Error() / Warning() / Msg()
+#include <stdint.h>
+#include "tier0/dbg.h"	// Error() / Warning()
 
 #if defined( HAVE_ASTCENC )
 	#include <astcenc.h>
 	#include <thread>
+	#include <mutex>
+	#include <condition_variable>
+	#include <functional>
 	#include <vector>
+	#include <cstdint>
+	#ifdef _WIN32
+		#include <direct.h>
+		#define ASTC_MKDIR( p ) _mkdir( p )
+	#else
+		#include <sys/stat.h>
+		#define ASTC_MKDIR( p ) mkdir( p, 0755 )
+	#endif
 #endif
 
 #define D3DFMT_A8R8G8B8      21
@@ -44,109 +54,108 @@
 #define D3DFMT_L8            50
 #define D3DFMT_A8L8          51
 
-// ---------------------------------------------------------------------------
-// GL enums used to describe the *source* pixel layout. Individually guarded so
-// this file works with or without the real GL headers in front of it.
-// ---------------------------------------------------------------------------
+// GL source-layout enums. Guarded so this file builds with or without the GL headers.
 #ifndef GL_UNSIGNED_BYTE
-#define GL_UNSIGNED_BYTE					0x1401
+#define GL_UNSIGNED_BYTE				0x1401
 #endif
 #ifndef GL_UNSIGNED_SHORT
-#define GL_UNSIGNED_SHORT					0x1403
+#define GL_UNSIGNED_SHORT				0x1403
 #endif
 #ifndef GL_FLOAT
-#define GL_FLOAT							0x1406
+#define GL_FLOAT						0x1406
 #endif
 #ifndef GL_HALF_FLOAT_ARB
-#define GL_HALF_FLOAT_ARB					0x140B
+#define GL_HALF_FLOAT_ARB				0x140B
 #endif
 #ifndef GL_HALF_FLOAT_OES
-#define GL_HALF_FLOAT_OES					0x8D61
+#define GL_HALF_FLOAT_OES				0x8D61
 #endif
 #ifndef GL_UNSIGNED_SHORT_4_4_4_4
-#define GL_UNSIGNED_SHORT_4_4_4_4			0x8033
+#define GL_UNSIGNED_SHORT_4_4_4_4		0x8033
 #endif
 #ifndef GL_UNSIGNED_SHORT_5_5_5_1
-#define GL_UNSIGNED_SHORT_5_5_5_1			0x8034
+#define GL_UNSIGNED_SHORT_5_5_5_1		0x8034
 #endif
 #ifndef GL_UNSIGNED_INT_8_8_8_8
-#define GL_UNSIGNED_INT_8_8_8_8				0x8035
+#define GL_UNSIGNED_INT_8_8_8_8			0x8035
 #endif
 #ifndef GL_UNSIGNED_INT_10_10_10_2
-#define GL_UNSIGNED_INT_10_10_10_2			0x8036
+#define GL_UNSIGNED_INT_10_10_10_2		0x8036
 #endif
 #ifndef GL_UNSIGNED_SHORT_5_6_5
-#define GL_UNSIGNED_SHORT_5_6_5				0x8363
+#define GL_UNSIGNED_SHORT_5_6_5			0x8363
 #endif
 #ifndef GL_UNSIGNED_SHORT_4_4_4_4_REV
-#define GL_UNSIGNED_SHORT_4_4_4_4_REV		0x8365
+#define GL_UNSIGNED_SHORT_4_4_4_4_REV	0x8365
 #endif
 #ifndef GL_UNSIGNED_SHORT_1_5_5_5_REV
-#define GL_UNSIGNED_SHORT_1_5_5_5_REV		0x8366
+#define GL_UNSIGNED_SHORT_1_5_5_5_REV	0x8366
 #endif
 #ifndef GL_UNSIGNED_INT_8_8_8_8_REV
-#define GL_UNSIGNED_INT_8_8_8_8_REV			0x8367
+#define GL_UNSIGNED_INT_8_8_8_8_REV		0x8367
 #endif
 #ifndef GL_UNSIGNED_INT_2_10_10_10_REV
-#define GL_UNSIGNED_INT_2_10_10_10_REV		0x8368
+#define GL_UNSIGNED_INT_2_10_10_10_REV	0x8368
 #endif
 #ifndef GL_RED
-#define GL_RED								0x1903
+#define GL_RED							0x1903
 #endif
 #ifndef GL_ALPHA
-#define GL_ALPHA							0x1906
+#define GL_ALPHA						0x1906
 #endif
 #ifndef GL_RGB
-#define GL_RGB								0x1907
+#define GL_RGB							0x1907
 #endif
 #ifndef GL_RGBA
-#define GL_RGBA								0x1908
+#define GL_RGBA							0x1908
 #endif
 #ifndef GL_LUMINANCE
-#define GL_LUMINANCE						0x1909
+#define GL_LUMINANCE					0x1909
 #endif
 #ifndef GL_LUMINANCE_ALPHA
-#define GL_LUMINANCE_ALPHA					0x190A
+#define GL_LUMINANCE_ALPHA				0x190A
 #endif
 #ifndef GL_BGR
-#define GL_BGR								0x80E0
+#define GL_BGR							0x80E0
 #endif
 #ifndef GL_BGRA
-#define GL_BGRA								0x80E1
+#define GL_BGRA							0x80E1
 #endif
 #ifndef GL_RG
-#define GL_RG								0x8227
+#define GL_RG							0x8227
 #endif
 
 // ---------------------------------------------------------------------------
-// ConVars (declared extern in astc_texcompress.h so cglmtex.cpp etc. can see them)
+// ConVars
 // ---------------------------------------------------------------------------
 
 ConVar gl_astc_recompress( "gl_astc_recompress", "1", FCVAR_ARCHIVE,
-	"Legacy toggle, kept only so existing configs/launch options that set "
-	"this don't fail to parse. ASTC recompression of every eligible "
-	"texture is mandatory and this convar's value is not read." );
+	"Legacy toggle, kept so existing configs still parse. ASTC recompression is mandatory and this value is not read." );
 
 ConVar gl_astc_block_ldr( "gl_astc_block_ldr", "6x6", FCVAR_ARCHIVE,
-	"ASTC block footprint for 8/16-bit normalized sources (this includes "
-	"DXT1/3/5, which are decoded to RGBA before re-encoding). Smaller "
-	"blocks (4x4) = higher quality/bigger; larger blocks (8x8) = smaller. "
-	"Invalid values fall back to 6x6." );
+	"ASTC block footprint for 8/16-bit normalized sources (includes DXT1/3/5, which are decoded first). "
+	"4x4 = best quality, largest. 8x8 = smallest. Invalid values fall back to 6x6." );
 
 ConVar gl_astc_block_hdr( "gl_astc_block_hdr", "4x4", FCVAR_ARCHIVE,
-	"ASTC block footprint for half-float / float (HDR) sources. "
-	"Invalid values fall back to 4x4." );
+	"ASTC block footprint for half/float (HDR) sources. Invalid values fall back to 4x4." );
 
 ConVar gl_astc_quality( "gl_astc_quality", "60", FCVAR_ARCHIVE,
-	"ASTC encoder quality/speed tradeoff, 0 (fastest) - 100 (exhaustive)." );
+	"ASTC encoder effort, 0 (fastest) - 100 (exhaustive). Higher is slower on first encode; the disk cache removes that cost after the first launch." );
 
 ConVar gl_astc_threads( "gl_astc_threads", "0", FCVAR_ARCHIVE,
-	"Encoder threads used for each texture upload. 0 = auto (up to 4), 1 = single threaded." );
+	"Encoder worker threads. 0 = auto (hardware threads, max 4). 1 = single threaded. Applied at first use; restart to change." );
 
-ConVar gl_astc_shadow_max_kb( "gl_astc_shadow_max_kb", "4096", FCVAR_ARCHIVE,
-	"Non-mipped ASTC textures up to this size (KB, uncompressed) keep a CPU copy of their pixels "
-	"after Unlock so that later partial (sub-rect) locks can be merged and re-encoded. "
-	"Larger/mipped textures free the copy to save RAM." );
+ConVar gl_astc_cache( "gl_astc_cache", "1", FCVAR_ARCHIVE,
+	"1 = cache encoded ASTC blocks on disk, keyed by source pixels and encode parameters. Later loads of the same texture skip encoding." );
+
+ConVar gl_astc_cache_dir( "gl_astc_cache_dir", "astc_cache", FCVAR_ARCHIVE,
+	"Directory for the ASTC encode cache, relative to the game's working directory. Safe to delete at any time." );
+
+ConVar gl_astc_alpha_weight( "gl_astc_alpha_weight", "1", FCVAR_ARCHIVE,
+	"1 = alpha-weighted encoding for textures that have an alpha channel. Improves color accuracy in translucent areas." );
+
+ConVar gl_astc_perceptual( "gl_astc_perceptual", "1", FCVAR_ARCHIVE,
+	"1 = use the perceptual error metric for LDR (8/16-bit) encodes. Matches how the eye judges color error." );
 
 // ---------------------------------------------------------------------------
 // Format classification
@@ -169,7 +178,7 @@ bool ASTC_IsEligibleFormat( int d3dFormat )
 		case D3DFMT_A16B16G16R16:
 		case D3DFMT_L8:
 		case D3DFMT_A8L8:
-		case D3DFMT_Q8W8V8U8:		// straight RGBA-shaped bytes (shader does the scale/bias)
+		case D3DFMT_Q8W8V8U8:
 		case D3DFMT_A16B16G16R16F:
 		case D3DFMT_R32F:
 		case D3DFMT_A32B32G32R32F:
@@ -188,7 +197,7 @@ bool ASTC_IsHDRFormat( int d3dFormat )
 		case D3DFMT_R32F:
 			return true;
 		default:
-			return false;	// everything else is a normalized ("byte-ish") format -> LDR
+			return false;
 	}
 }
 
@@ -207,22 +216,6 @@ bool ASTC_FormatHasAlpha( int d3dFormat )
 			return true;
 	}
 }
-
-// ---------------------------------------------------------------------------
-// GPU capability
-// ---------------------------------------------------------------------------
-
-static bool s_bHWLDR = true;
-static bool s_bHWHDR = true;
-
-void ASTC_SetHardwareSupport( bool ldr, bool hdr )
-{
-	s_bHWLDR = ldr;
-	s_bHWHDR = hdr;
-}
-
-bool ASTC_HardwareSupportsLDR() { return s_bHWLDR; }
-bool ASTC_HardwareSupportsHDR() { return s_bHWHDR; }
 
 // ---------------------------------------------------------------------------
 // Block sizes
@@ -263,8 +256,6 @@ bool ASTC_IsValidBlockSize( int w, int h )
 	return FindBlockEntry( w, h ) != NULL;
 }
 
-// Parse "6x6" style convar strings. Anything unparsable or not a real ASTC
-// footprint (e.g. "7x7", "3x3", "garbage") falls back to the profile default.
 static void ParseBlockSize( const char* str, int defW, int defH, int* outW, int* outH )
 {
 	int w = 0, h = 0;
@@ -280,26 +271,21 @@ static void ParseBlockSize( const char* str, int defW, int defH, int* outW, int*
 void ASTC_GetConfiguredBlockSize( bool isHDR, int* outW, int* outH )
 {
 	if ( isHDR )
-		ParseBlockSize( gl_astc_block_hdr.GetString(), 4, 4, outW, outH );	// HDR default: 4x4
+		ParseBlockSize( gl_astc_block_hdr.GetString(), 4, 4, outW, outH );
 	else
-		ParseBlockSize( gl_astc_block_ldr.GetString(), 6, 6, outW, outH );	// LDR default: 6x6
+		ParseBlockSize( gl_astc_block_ldr.GetString(), 6, 6, outW, outH );
 }
 
 static uint32_t GLInternalFormatForBlock( int blockW, int blockH, bool srgb )
 {
 	const ASTCBlockEntry* e = FindBlockEntry( blockW, blockH );
 	if ( !e )
-		e = FindBlockEntry( 6, 6 );		// unreachable for validated sizes
+		e = FindBlockEntry( 6, 6 );
 	return srgb ? e->srgbEnum : e->linearEnum;
 }
 
 // ---------------------------------------------------------------------------
-// Source pixel normalization
-//
-// Whatever (glFormat, glType) the caller has in memory is turned into a
-// tightly packed RGBA buffer: U8 RGBA8 for LDR, F32 RGBA for HDR. The
-// (glFormat, glType) pair describes the REAL memory layout, e.g.
-// GL_BGRA + GL_UNSIGNED_INT_8_8_8_8_REV = bytes B,G,R,A (D3DFMT_A8R8G8B8).
+// Source layout helpers (used by the conversion fallback)
 // ---------------------------------------------------------------------------
 
 enum ChanLayout
@@ -324,16 +310,14 @@ static ChanLayout LayoutFromGLFormat( unsigned int fmt, int* outComps )
 	}
 }
 
-// Unaligned-safe load (backing stores / decoded buffers are not guaranteed aligned).
 template< typename T >
 static inline T LoadT( const uint8_t* p )
 {
 	T v;
-	memcpy( &v, p, sizeof( T ) );
+	memcpy( &v, p, sizeof( T ) );	// unaligned-safe
 	return v;
 }
 
-// Scale a w-bit unsigned field to 8 bits with round-to-nearest.
 static inline uint8_t ScaleBitsTo8( uint32_t v, int w )
 {
 	const uint32_t maxv = ( 1u << w ) - 1u;
@@ -343,7 +327,6 @@ static inline uint8_t ScaleBitsTo8( uint32_t v, int w )
 static inline uint8_t ToU8( uint8_t v )  { return v; }
 static inline uint8_t ToU8( uint16_t v ) { return (uint8_t)( ( (uint32_t)v * 255u + 32767u ) / 65535u ); }
 
-// Reorders up to 4 raw components (in memory/format order) into R,G,B,A.
 template< typename V >
 static inline void MapChannels( ChanLayout lay, const V* c, V one, V* r, V* g, V* b, V* a )
 {
@@ -364,7 +347,6 @@ static inline void MapChannels( ChanLayout lay, const V* c, V one, V* r, V* g, V
 	}
 }
 
-// Plain (non-packed) 8 or 16 bit unsigned normalized channels.
 template< typename T >
 static void ConvertPlanarUNorm( const uint8_t* src, size_t n, ChanLayout lay, int comps, bool forceOpaque, uint8_t* dst )
 {
@@ -383,8 +365,6 @@ static void ConvertPlanarUNorm( const uint8_t* src, size_t n, ChanLayout lay, in
 	}
 }
 
-// Packed types. Widths are in COMPONENT order; 'rev' means the first component
-// sits in the least significant bits (the GL *_REV types).
 struct PackDesc { int nComps; int w[4]; bool rev; int totalBits; int storageBytes; };
 
 static bool GetPackDesc( unsigned int type, PackDesc* d )
@@ -416,7 +396,6 @@ static bool ConvertPackedUNorm( const uint8_t* src, size_t n, unsigned int fmt, 
 	else
 		lay = ( fmt == GL_BGRA ) ? kLay_BGRA : kLay_RGBA;
 
-	// Per-component shift / mask.
 	int shift[4] = { 0, 0, 0, 0 };
 	int acc = 0;
 	for ( int k = 0; k < d.nComps; ++k )
@@ -446,7 +425,7 @@ static bool ConvertPackedUNorm( const uint8_t* src, size_t n, unsigned int fmt, 
 	return true;
 }
 
-// Returns malloc'd n*4 bytes, or NULL if (glFormat, glType) isn't understood.
+// Returns malloc'd n*4 bytes (RGBA8), or NULL if (fmt, type) isn't understood.
 static uint8_t* ConvertToRGBA8( const void* srcData, size_t n, unsigned int glFormat, unsigned int glType, bool forceOpaque )
 {
 	uint8_t* dst = (uint8_t*)malloc( n * 4 );
@@ -459,23 +438,17 @@ static uint8_t* ConvertToRGBA8( const void* srcData, size_t n, unsigned int glFo
 	int comps = 0;
 	ChanLayout lay = LayoutFromGLFormat( glFormat, &comps );
 
-	if ( glType == GL_UNSIGNED_BYTE )
+	if ( glType == GL_UNSIGNED_BYTE && lay != kLay_Invalid )
 	{
-		if ( lay != kLay_Invalid )
-		{
-			ConvertPlanarUNorm<uint8_t>( src, n, lay, comps, forceOpaque, dst );
-			ok = true;
-		}
+		ConvertPlanarUNorm<uint8_t>( src, n, lay, comps, forceOpaque, dst );
+		ok = true;
 	}
-	else if ( glType == GL_UNSIGNED_SHORT )
+	else if ( glType == GL_UNSIGNED_SHORT && lay != kLay_Invalid )
 	{
-		if ( lay != kLay_Invalid )
-		{
-			ConvertPlanarUNorm<uint16_t>( src, n, lay, comps, forceOpaque, dst );
-			ok = true;
-		}
+		ConvertPlanarUNorm<uint16_t>( src, n, lay, comps, forceOpaque, dst );
+		ok = true;
 	}
-	else
+	else if ( glType != GL_UNSIGNED_BYTE && glType != GL_UNSIGNED_SHORT )
 	{
 		ok = ConvertPackedUNorm( src, n, glFormat, glType, forceOpaque, dst );
 	}
@@ -502,7 +475,6 @@ static float HalfToFloat( uint16_t h )
 		}
 		else
 		{
-			// subnormal: normalize
 			int e = -1;
 			do { e++; mant <<= 1; } while ( !( mant & 0x400 ) );
 			mant &= 0x3FF;
@@ -522,17 +494,16 @@ static float HalfToFloat( uint16_t h )
 	return f;
 }
 
-// astcenc's HDR profile cannot represent NaN/negative/huge values; clamp to what FP16 can hold.
 static inline float SanitizeHDR( float v )
 {
-	if ( !( v >= 0.0f ) )		// catches NaN and negatives
+	if ( !( v >= 0.0f ) )
 		return 0.0f;
 	if ( v > 65504.0f )
 		return 65504.0f;
 	return v;
 }
 
-// Returns malloc'd n*4 floats, or NULL if (glFormat, glType) isn't understood.
+// Returns malloc'd n*4 floats, or NULL if (fmt, type) isn't understood.
 static float* ConvertToRGBAF32( const void* srcData, size_t n, unsigned int glFormat, unsigned int glType, bool forceOpaque )
 {
 	float* dst = (float*)malloc( n * 4 * sizeof( float ) );
@@ -568,7 +539,7 @@ static float* ConvertToRGBAF32( const void* srcData, size_t n, unsigned int glFo
 		return dst;
 	}
 
-	// An HDR encode was requested for an integer source: widen it.
+	// Integer source for an HDR encode: widen to float.
 	uint8_t* tmp = ConvertToRGBA8( srcData, n, glFormat, glType, forceOpaque );
 	if ( !tmp )
 	{
@@ -581,10 +552,31 @@ static float* ConvertToRGBAF32( const void* srcData, size_t n, unsigned int glFo
 	return dst;
 }
 
+// Bytes per texel for (fmt, type). Used for cache keys.
+static size_t SrcTexelBytes( unsigned int fmt, unsigned int type )
+{
+	PackDesc d;
+	if ( GetPackDesc( type, &d ) )
+		return (size_t)d.storageBytes;
+
+	int comps = 0;
+	LayoutFromGLFormat( fmt, &comps );
+	size_t cs = 0;
+	if ( type == GL_UNSIGNED_BYTE )
+		cs = 1;
+	else if ( type == GL_UNSIGNED_SHORT || type == GL_HALF_FLOAT_ARB || type == GL_HALF_FLOAT_OES )
+		cs = 2;
+	else if ( type == GL_FLOAT )
+		cs = 4;
+	return (size_t)comps * cs;
+}
+
 // ---------------------------------------------------------------------------
 // astcenc glue
 // ---------------------------------------------------------------------------
 #if defined( HAVE_ASTCENC )
+
+static const uint32_t kCacheVersion = 2;
 
 static float QualityFromPreset( int qualityPreset )
 {
@@ -595,47 +587,148 @@ static float QualityFromPreset( int qualityPreset )
 	return ASTCENC_PRE_EXHAUSTIVE;
 }
 
-// Creating an astcenc context builds large lookup tables (many ms), so each
-// thread keeps a few of them around instead of creating one per texture.
-struct CachedContext
+// ---- Persistent worker pool -------------------------------------------------
+// astcenc is built for this pattern: N threads call astcenc_compress_image() on
+// the same context with thread indices 0..N-1 and share the work. A persistent
+// pool avoids creating and joining threads for every texture.
+class EncodePool
 {
-	astcenc_context*	ctx;
-	astcenc_profile		profile;
-	int					blockW, blockH;
-	float				quality;
-	unsigned int		threads;
-};
-
-struct ContextCache
-{
-	enum { kSlots = 4 };
-	CachedContext	slot[kSlots];
-	int				nextVictim;
-
-	ContextCache() { memset( slot, 0, sizeof( slot ) ); nextVictim = 0; }
-	~ContextCache()
+public:
+	explicit EncodePool( unsigned n ) : m_size( n ? n : 1 ), m_gen( 0 ), m_pending( 0 ), m_active( 0 ), m_stop( false ), m_fn( NULL )
 	{
-		for ( int i = 0; i < kSlots; ++i )
+		for ( unsigned t = 1; t < m_size; ++t )
+			m_workers.push_back( std::thread( &EncodePool::WorkerMain, this, t ) );
+	}
+
+	~EncodePool()
+	{
 		{
-			if ( slot[i].ctx )
-				astcenc_context_free( slot[i].ctx );
+			std::lock_guard<std::mutex> lock( m_mtx );
+			m_stop = true;
+		}
+		m_cv.notify_all();
+		for ( size_t i = 0; i < m_workers.size(); ++i )
+			m_workers[i].join();
+	}
+
+	unsigned Size() const { return m_size; }
+
+	// Runs fn(0..active-1) concurrently. The calling thread is index 0.
+	void Run( unsigned active, const std::function<void( unsigned )>& fn )
+	{
+		std::lock_guard<std::mutex> runLock( m_runMtx );
+		if ( active > 1 )
+		{
+			{
+				std::lock_guard<std::mutex> lock( m_mtx );
+				m_fn = &fn;
+				m_active = active;
+				m_pending = active - 1;
+				++m_gen;
+			}
+			m_cv.notify_all();
+		}
+
+		fn( 0 );
+
+		if ( active > 1 )
+		{
+			std::unique_lock<std::mutex> lock( m_mtx );
+			m_doneCv.wait( lock, [this]() { return m_pending == 0; } );
+			m_fn = NULL;
 		}
 	}
+
+private:
+	void WorkerMain( unsigned idx )
+	{
+		uint64_t seen = 0;
+		for ( ;; )
+		{
+			const std::function<void( unsigned )>* fn = NULL;
+			{
+				std::unique_lock<std::mutex> lock( m_mtx );
+				m_cv.wait( lock, [this, &seen]() { return m_stop || m_gen != seen; } );
+				if ( m_stop )
+					return;
+				seen = m_gen;
+				if ( idx >= m_active )
+					continue;
+				fn = m_fn;
+			}
+
+			( *fn )( idx );
+
+			std::lock_guard<std::mutex> lock( m_mtx );
+			if ( --m_pending == 0 )
+				m_doneCv.notify_one();
+		}
+	}
+
+	unsigned					m_size;
+	std::vector<std::thread>	m_workers;
+	std::mutex					m_mtx;
+	std::mutex					m_runMtx;
+	std::condition_variable		m_cv;
+	std::condition_variable		m_doneCv;
+	uint64_t					m_gen;
+	unsigned					m_pending;
+	unsigned					m_active;
+	bool						m_stop;
+	const std::function<void( unsigned )>* m_fn;
 };
 
-static astcenc_context* AcquireContext( astcenc_profile profile, int bw, int bh, float quality, unsigned int threads )
+static unsigned ChooseWorkerCount()
 {
-	static thread_local ContextCache cache;
+	const int configured = gl_astc_threads.GetInt();
+	if ( configured > 0 )
+		return (unsigned)( configured > 16 ? 16 : configured );
 
-	for ( int i = 0; i < ContextCache::kSlots; ++i )
+	unsigned hw = std::thread::hardware_concurrency();
+	if ( hw == 0 )
+		hw = 1;
+	return hw > 4 ? 4 : hw;
+}
+
+// Intentionally never destroyed: avoids static-destruction-order issues at exit.
+static EncodePool* GetPool()
+{
+	static EncodePool* pool = new EncodePool( ChooseWorkerCount() );
+	return pool;
+}
+
+// ---- Shared, read-only-after-build encoder contexts --------------------------
+// Building an astcenc context creates its large search tables. One context per
+// (profile, block, quality, flags, threads) is built and then reused by every
+// texture upload that needs it.
+struct SharedCtx
+{
+	astcenc_profile	profile;
+	int				blockW, blockH;
+	int				qualityKey;		// quality * 1000, integer for exact matching
+	uint32_t		flags;
+	unsigned		threads;
+	astcenc_context* ctx;
+};
+
+static std::mutex				s_ctxMutex;
+static std::vector<SharedCtx>	s_ctxs;
+static std::mutex				s_encodeMutex;	// an astcenc context must not be used by two calls at once
+
+static astcenc_context* AcquireSharedContext( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags, unsigned threads )
+{
+	std::lock_guard<std::mutex> lock( s_ctxMutex );
+
+	const int qKey = (int)( quality * 1000.0f + 0.5f );
+	for ( size_t i = 0; i < s_ctxs.size(); ++i )
 	{
-		CachedContext& c = cache.slot[i];
-		if ( c.ctx && c.profile == profile && c.blockW == bw && c.blockH == bh && c.quality == quality && c.threads == threads )
+		const SharedCtx& c = s_ctxs[i];
+		if ( c.profile == profile && c.blockW == bw && c.blockH == bh && c.qualityKey == qKey && c.flags == flags && c.threads == threads )
 			return c.ctx;
 	}
 
 	astcenc_config config;
-	astcenc_error status = astcenc_config_init( profile, bw, bh, 1, quality, 0, &config );
+	astcenc_error status = astcenc_config_init( profile, bw, bh, 1, quality, flags, &config );
 	if ( status != ASTCENC_SUCCESS )
 	{
 		Warning( "ASTC: astcenc_config_init(%dx%d) failed: %s\n", bw, bh, astcenc_get_error_string( status ) );
@@ -650,62 +743,201 @@ static astcenc_context* AcquireContext( astcenc_profile profile, int bw, int bh,
 		return NULL;
 	}
 
-	CachedContext& victim = cache.slot[cache.nextVictim];
-	cache.nextVictim = ( cache.nextVictim + 1 ) % ContextCache::kSlots;
-	if ( victim.ctx )
-		astcenc_context_free( victim.ctx );
-
-	victim.ctx = ctx;
-	victim.profile = profile;
-	victim.blockW = bw;
-	victim.blockH = bh;
-	victim.quality = quality;
-	victim.threads = threads;
+	SharedCtx entry = { profile, bw, bh, qKey, flags, threads, ctx };
+	s_ctxs.push_back( entry );
 	return ctx;
 }
 
-static unsigned int PickThreadCount( int width, int height )
+static astcenc_error EncodeImage( astcenc_profile profile, int bw, int bh, float quality, uint32_t flags,
+								  const astcenc_image& image, const astcenc_swizzle& swz,
+								  uint8_t* out, size_t outSize, bool smallImage )
 {
-	// Tiny images (most mip tails, small UI bits) are not worth the thread spin-up.
-	if ( (int64_t)width * height < 128 * 128 )
-		return 1;
+	// Tiny images are not worth the fan-out. Use a single-thread context.
+	const unsigned threads = smallImage ? 1u : GetPool()->Size();
 
-	int configured = gl_astc_threads.GetInt();
-	if ( configured > 0 )
-		return (unsigned int)( configured > 16 ? 16 : configured );
+	astcenc_context* ctx = AcquireSharedContext( profile, bw, bh, quality, flags, threads );
+	if ( !ctx )
+		return ASTCENC_ERR_BAD_PARAM;
 
-	unsigned int hw = std::thread::hardware_concurrency();
-	if ( hw == 0 ) hw = 1;
-	return hw > 4 ? 4 : hw;
-}
+	std::lock_guard<std::mutex> lock( s_encodeMutex );
 
-static astcenc_error RunCompress( astcenc_context* ctx, astcenc_image* image, const astcenc_swizzle* swizzle,
-								  uint8_t* out, size_t outSize, unsigned int threads )
-{
-	if ( threads <= 1 )
-		return astcenc_compress_image( ctx, image, swizzle, out, outSize, 0 );
-
-	// astcenc is designed for this: every thread calls compress_image on the same
-	// context with its own thread_index and they share the work internally.
 	std::vector<astcenc_error> status( threads, ASTCENC_SUCCESS );
-	std::vector<std::thread> workers;
-	workers.reserve( threads - 1 );
-	for ( unsigned int t = 1; t < threads; ++t )
+	if ( threads == 1 )
 	{
-		workers.push_back( std::thread( [ctx, image, swizzle, out, outSize, t, &status]() {
-			status[t] = astcenc_compress_image( ctx, image, swizzle, out, outSize, t );
-		} ) );
+		status[0] = astcenc_compress_image( ctx, &image, &swz, out, outSize, 0 );
 	}
-	status[0] = astcenc_compress_image( ctx, image, swizzle, out, outSize, 0 );
-	for ( size_t i = 0; i < workers.size(); ++i )
-		workers[i].join();
+	else
+	{
+		GetPool()->Run( threads, [&]( unsigned t )
+		{
+			status[t] = astcenc_compress_image( ctx, &image, &swz, out, outSize, t );
+		} );
+	}
+	astcenc_compress_reset( ctx );	// required before the context can encode another image
 
-	for ( unsigned int t = 0; t < threads; ++t )
+	for ( unsigned t = 0; t < threads; ++t )
 	{
 		if ( status[t] != ASTCENC_SUCCESS )
 			return status[t];
 	}
 	return ASTCENC_SUCCESS;
+}
+
+// ---- Source preparation -----------------------------------------------------
+struct SourcePlan
+{
+	const void*			ptr;		// what astcenc reads
+	void*				owned;		// malloc'd conversion buffer, or NULL
+	bool				isFloat;
+	astcenc_swizzle		swz;
+};
+
+static void SetIdentitySwizzle( astcenc_swizzle* s )
+{
+	s->r = ASTCENC_SWZ_R;
+	s->g = ASTCENC_SWZ_G;
+	s->b = ASTCENC_SWZ_B;
+	s->a = ASTCENC_SWZ_A;
+}
+
+// Fast path: 8-bit BGRA/RGBA memory order needs no copy. Channel order and
+// forced alpha are handled by the swizzle. Everything else gets converted.
+static bool PrepareSource( const void* src, size_t n, unsigned int fmt, unsigned int type,
+						   bool isHDR, bool forceOpaque, SourcePlan* plan )
+{
+	memset( plan, 0, sizeof( *plan ) );
+	SetIdentitySwizzle( &plan->swz );
+
+	if ( !isHDR )
+	{
+		const bool byteOrder = ( type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV )
+							&& ( fmt == GL_RGBA || fmt == GL_BGRA );
+		if ( byteOrder )
+		{
+			plan->ptr = src;
+			if ( fmt == GL_BGRA )
+			{
+				// Memory is B,G,R,A. astcenc reads memory slots as r,g,b,a,
+				// so swap the red and blue slots.
+				plan->swz.r = ASTCENC_SWZ_B;
+				plan->swz.b = ASTCENC_SWZ_R;
+			}
+			if ( forceOpaque )
+				plan->swz.a = ASTCENC_SWZ_1;
+			return true;
+		}
+
+		uint8_t* rgba = ConvertToRGBA8( src, n, fmt, type, forceOpaque );
+		if ( !rgba )
+			return false;
+		plan->owned = rgba;
+		plan->ptr = rgba;
+		return true;
+	}
+
+	float* rgbaF = ConvertToRGBAF32( src, n, fmt, type, forceOpaque );
+	if ( !rgbaF )
+		return false;
+	plan->owned = rgbaF;
+	plan->ptr = rgbaF;
+	plan->isFloat = true;
+	return true;
+}
+
+// ---- Disk cache -------------------------------------------------------------
+static uint64_t MixHash( uint64_t h, const void* data, size_t n )
+{
+	const uint8_t* p = (const uint8_t*)data;
+	size_t i = 0;
+	for ( ; i + 8 <= n; i += 8 )
+	{
+		uint64_t w;
+		memcpy( &w, p + i, 8 );
+		h = ( h ^ w ) * 0x9E3779B97F4A7C15ULL;
+		h ^= h >> 29;
+	}
+	for ( ; i < n; ++i )
+		h = ( h ^ p[i] ) * 0x100000001B3ULL;
+	return h;
+}
+
+struct CacheHeader
+{
+	char		magic[4];	// "ASTC"
+	uint32_t	version;
+	uint32_t	dataSize;
+	uint64_t	key;
+};
+
+static uint64_t ComputeCacheKey( const void* src, size_t srcBytes, const uint32_t params[12] )
+{
+	uint64_t h = 0xCBF29CE484222325ULL;
+	h = MixHash( h, params, sizeof( uint32_t ) * 12 );
+	h = MixHash( h, src, srcBytes );
+	return h;
+}
+
+static void CachePath( char* out, size_t outSize, uint64_t key )
+{
+	snprintf( out, outSize, "%s/%016llx.astc", gl_astc_cache_dir.GetString(), (unsigned long long)key );
+}
+
+static void EnsureCacheDir()
+{
+	static bool s_done = false;
+	if ( !s_done )
+	{
+		ASTC_MKDIR( gl_astc_cache_dir.GetString() );	// EEXIST is fine
+		s_done = true;
+	}
+}
+
+static bool CacheLoad( uint64_t key, uint8_t* dst, size_t dstSize )
+{
+	char path[1024];
+	CachePath( path, sizeof( path ), key );
+
+	FILE* f = fopen( path, "rb" );
+	if ( !f )
+		return false;
+
+	CacheHeader hd;
+	bool ok = fread( &hd, sizeof( hd ), 1, f ) == 1
+		   && memcmp( hd.magic, "ASTC", 4 ) == 0
+		   && hd.version == kCacheVersion
+		   && hd.key == key
+		   && hd.dataSize == dstSize
+		   && fread( dst, dstSize, 1, f ) == 1;
+	fclose( f );
+	return ok;
+}
+
+static void CacheStore( uint64_t key, const uint8_t* data, size_t size )
+{
+	EnsureCacheDir();
+
+	char path[1024], tmp[1100];
+	CachePath( path, sizeof( path ), key );
+	snprintf( tmp, sizeof( tmp ), "%s.%016llx.tmp", path, (unsigned long long)key );
+
+	FILE* f = fopen( tmp, "wb" );
+	if ( !f )
+		return;
+
+	CacheHeader hd;
+	memcpy( hd.magic, "ASTC", 4 );
+	hd.version = kCacheVersion;
+	hd.dataSize = (uint32_t)size;
+	hd.key = key;
+
+	bool ok = fwrite( &hd, sizeof( hd ), 1, f ) == 1 && fwrite( data, size, 1, f ) == 1;
+	fclose( f );
+
+	// Write-then-rename so a crash never leaves a half-written cache entry.
+	if ( ok )
+		rename( tmp, path );
+	else
+		remove( tmp );
 }
 
 #endif // HAVE_ASTCENC
@@ -731,7 +963,6 @@ bool ASTC_CompressTexture(
 		memset( outResult, 0, sizeof( *outResult ) );
 
 #if !defined( HAVE_ASTCENC )
-	// astc-encoder isn't vendored/enabled in this build.
 	(void)srcData; (void)width; (void)height; (void)srcGLFormat; (void)srcGLType;
 	(void)isHDR; (void)isSRGB; (void)forceOpaque; (void)blockW; (void)blockH; (void)qualityPreset;
 	return false;
@@ -740,56 +971,70 @@ bool ASTC_CompressTexture(
 		return false;
 
 	const size_t nPixels = (size_t)width * (size_t)height;
+	const size_t xBlocks = ( (size_t)width  + blockW - 1 ) / blockW;
+	const size_t yBlocks = ( (size_t)height + blockH - 1 ) / blockH;
+	const size_t compSize = xBlocks * yBlocks * 16;	// every ASTC block is 16 bytes
 
-	void* rgba = isHDR ? (void*)ConvertToRGBAF32( srcData, nPixels, srcGLFormat, srcGLType, forceOpaque )
-					   : (void*)ConvertToRGBA8( srcData, nPixels, srcGLFormat, srcGLType, forceOpaque );
-	if ( !rgba )
+	const astcenc_profile profile = isHDR ? ASTCENC_PRF_HDR : ( isSRGB ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR );
+	const float quality = QualityFromPreset( qualityPreset );
+
+	uint32_t flags = 0;
+	if ( !forceOpaque && gl_astc_alpha_weight.GetBool() )
+		flags |= ASTCENC_FLG_USE_ALPHA_WEIGHT;
+	if ( !isHDR && gl_astc_perceptual.GetBool() )
+		flags |= ASTCENC_FLG_USE_PERCEPTUAL;
+
+	uint8_t* compData = (uint8_t*)malloc( compSize );
+	if ( !compData )
+		return false;
+
+	// Disk cache lookup. Keyed on the exact source bytes plus every parameter that changes the output.
+	const bool useCache = gl_astc_cache.GetBool() && gl_astc_cache_dir.GetString()[0] != '\0';
+	uint64_t key = 0;
+	if ( useCache )
+	{
+		const uint32_t params[12] = {
+			kCacheVersion, srcGLFormat, srcGLType, (uint32_t)width, (uint32_t)height,
+			isHDR, isSRGB, forceOpaque, (uint32_t)blockW, (uint32_t)blockH,
+			(uint32_t)qualityPreset, flags
+		};
+		key = ComputeCacheKey( srcData, nPixels * SrcTexelBytes( srcGLFormat, srcGLType ), params );
+
+		if ( CacheLoad( key, compData, compSize ) )
+		{
+			outResult->m_pData = compData;
+			outResult->m_nDataSize = (uint32_t)compSize;
+			outResult->m_glInternalFormat = GLInternalFormatForBlock( blockW, blockH, isSRGB && !isHDR );
+			outResult->m_blockW = blockW;
+			outResult->m_blockH = blockH;
+			outResult->m_profile = isHDR ? kASTCProfile_HDR : kASTCProfile_LDR;
+			return true;
+		}
+	}
+
+	// Cache miss: prepare the source and encode.
+	SourcePlan plan;
+	if ( !PrepareSource( srcData, nPixels, srcGLFormat, srcGLType, isHDR, forceOpaque, &plan ) )
 	{
 		Warning( "ASTC: unsupported source layout (GL format 0x%X, type 0x%X)\n", srcGLFormat, srcGLType );
+		free( compData );
 		return false;
 	}
 
-	// sRGB is an LDR-only concept. The encoder must be told, otherwise it
-	// models the wrong endpoint expansion for what the GPU will decode.
-	const astcenc_profile profile = isHDR ? ASTCENC_PRF_HDR : ( isSRGB ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR );
-	const unsigned int threads = PickThreadCount( width, height );
-
-	astcenc_context* context = AcquireContext( profile, blockW, blockH, QualityFromPreset( qualityPreset ), threads );
-	if ( !context )
-	{
-		free( rgba );
-		return false;
-	}
-
-	void* sliceArray[1] = { rgba };
+	void* sliceArray[1] = { const_cast<void*>( plan.ptr ) };
 	astcenc_image image;
 	memset( &image, 0, sizeof( image ) );
 	image.dim_x = width;
 	image.dim_y = height;
 	image.dim_z = 1;
-	image.data_type = isHDR ? ASTCENC_TYPE_F32 : ASTCENC_TYPE_U8;
+	image.data_type = plan.isFloat ? ASTCENC_TYPE_F32 : ASTCENC_TYPE_U8;
 	image.data = sliceArray;
 
-	astcenc_swizzle swizzle;
-	swizzle.r = ASTCENC_SWZ_R;
-	swizzle.g = ASTCENC_SWZ_G;
-	swizzle.b = ASTCENC_SWZ_B;
-	swizzle.a = ASTCENC_SWZ_A;
+	const bool smallImage = (int64_t)width * height < 128 * 128;
+	astcenc_error status = EncodeImage( profile, blockW, blockH, quality, flags, image, plan.swz,
+										compData, compSize, smallImage );
 
-	const size_t xBlocks = ( (size_t)width  + blockW - 1 ) / blockW;
-	const size_t yBlocks = ( (size_t)height + blockH - 1 ) / blockH;
-	const size_t compSize = xBlocks * yBlocks * 16;	// ASTC blocks are always 16 bytes
-
-	uint8_t* compData = (uint8_t*)malloc( compSize );
-	if ( !compData )
-	{
-		free( rgba );
-		return false;
-	}
-
-	astcenc_error status = RunCompress( context, &image, &swizzle, compData, compSize, threads );
-	astcenc_compress_reset( context );		// required before this context can encode another image
-	free( rgba );
+	free( plan.owned );
 
 	if ( status != ASTCENC_SUCCESS )
 	{
@@ -797,6 +1042,9 @@ bool ASTC_CompressTexture(
 		free( compData );
 		return false;
 	}
+
+	if ( useCache )
+		CacheStore( key, compData, compSize );
 
 	outResult->m_pData = compData;
 	outResult->m_nDataSize = (uint32_t)compSize;
@@ -819,7 +1067,7 @@ void ASTC_FreeResult( ASTCEncodeResult* result )
 }
 
 // ---------------------------------------------------------------------------
-// Mandatory compression entry point (no uncompressed fallback allowed).
+// Mandatory compression entry point (no uncompressed fallback)
 // ---------------------------------------------------------------------------
 void ASTC_CompressTextureRequired(
 		bool isHDR,
@@ -835,14 +1083,6 @@ void ASTC_CompressTextureRequired(
 	if ( outResult )
 		memset( outResult, 0, sizeof( *outResult ) );
 
-	if ( ( isHDR && !ASTC_HardwareSupportsHDR() ) || ( !isHDR && !ASTC_HardwareSupportsLDR() ) )
-	{
-		Error( "ASTC_CompressTextureRequired: this GPU/driver does not report %s. "
-			   "Mandatory ASTC recompression cannot be used on it.\n",
-			   isHDR ? "GL_KHR_texture_compression_astc_hdr" : "GL_KHR_texture_compression_astc_ldr" );
-		return;
-	}
-
 	int blockW, blockH;
 	ASTC_GetConfiguredBlockSize( isHDR, &blockW, &blockH );
 
@@ -850,24 +1090,19 @@ void ASTC_CompressTextureRequired(
 								isHDR, isSRGB, forceOpaque, blockW, blockH, gl_astc_quality.GetInt(),
 								outResult ) )
 	{
-		// ASTC-eligible textures are never allowed to reach the GPU uncompressed.
-		// Either this build wasn't compiled with HAVE_ASTCENC / astcenc linked in,
-		// the source layout is unknown, or the encode itself failed.
-		Error( "ASTC_CompressTextureRequired: mandatory %s ASTC compression failed "
-			   "for a %dx%d texture (block %dx%d, GL format 0x%X type 0x%X). "
-			   "Uncompressed upload of this texture is disabled -- build with HAVE_ASTCENC "
-			   "defined and the astc-encoder sources linked in.\n",
+		Error( "ASTC_CompressTextureRequired: mandatory %s ASTC compression failed for a %dx%d texture "
+			   "(block %dx%d, GL format 0x%X type 0x%X). Uncompressed upload is disabled; build with "
+			   "HAVE_ASTCENC and link astcenc.\n",
 			   isHDR ? "HDR" : "LDR", width, height, blockW, blockH, srcGLFormat, srcGLType );
-		return;
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Solid-color ASTC image (void-extent blocks). No encoder needed.
 //
-// ASTC void-extent block (2D): bits[8:0]=0x1FC, bit9 = D (0 LDR / 1 HDR),
-// bits[11:10]=11, extent coordinates all-ones (= "no extent given"), then
-// R,G,B,A as 16-bit values (UNORM16 for LDR, IEEE half for HDR).
+// 2D void-extent block: bits[8:0] = 0x1FC, bit 9 = D (0 LDR, 1 HDR),
+// bits[11:10] = 11, extent coords all ones, then R,G,B,A as 16-bit values
+// (UNORM16 for LDR, IEEE half for HDR).
 // ---------------------------------------------------------------------------
 bool ASTC_MakeBlankTexture(
 		bool isHDR,
@@ -895,13 +1130,13 @@ bool ASTC_MakeBlankTexture(
 	if ( !data )
 		return false;
 
-	const uint16_t alphaBits = opaqueAlpha ? ( isHDR ? 0x3C00 : 0xFFFF ) : 0x0000;	// 1.0 as half / unorm16
+	const uint16_t alphaBits = opaqueAlpha ? ( isHDR ? 0x3C00 : 0xFFFF ) : 0x0000;
 
 	uint8_t block[16];
 	block[0] = 0xFC;
 	block[1] = isHDR ? 0xFF : 0xFD;
 	memset( block + 2, 0xFF, 6 );
-	memset( block + 8, 0x00, 6 );					// R = G = B = 0
+	memset( block + 8, 0x00, 6 );	// R = G = B = 0
 	block[14] = (uint8_t)( alphaBits & 0xFF );
 	block[15] = (uint8_t)( alphaBits >> 8 );
 
