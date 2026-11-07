@@ -4947,6 +4947,12 @@ void CMeshMgr::FillVertexIDBuffer( CVertexBuffer *pVertexIDBuffer, int nCount )
 	// Fill the buffer with the values 0->(nCount-1)
 	int nBaseVertexIndex = 0;
 	float *pBuffer = (float*)pVertexIDBuffer->Lock( nCount, nBaseVertexIndex );	
+	if ( !pBuffer )
+	{
+		// CVertexBuffer::Lock returns NULL if there is no buffer to lock (device not ready) or the lock failed; nothing was locked
+		Warning( "CMeshMgr::FillVertexIDBuffer: could not lock the vertex ID buffer\n" );
+		return;
+	}
 	for ( int i = 0; i < nCount; ++i )
 	{
 		*pBuffer++ = (float)i;
@@ -5969,7 +5975,12 @@ void CMeshMgr::SetIndexStreamState( int firstVertexIdx )
 	if ( g_pLastIndex || g_pLastIndexBuffer != pDx9Buffer )
 	{
 		Dx9Device()->SetIndices( pDx9Buffer );
-		pIndexBuffer->HandlePerFrameTextureStats( ShaderAPI()->GetCurrentFrameCounter() );
+		// pIndexBuffer is NULL when the draw has no index buffer (pDx9Buffer is computed null-safe above); this runs when the
+		// previous draw did have one
+		if ( pIndexBuffer )
+		{
+			pIndexBuffer->HandlePerFrameTextureStats( ShaderAPI()->GetCurrentFrameCounter() );
+		}
 
 		g_pLastIndexBuffer = pDx9Buffer;
 		SafeRelease( &g_pLastIndex );
