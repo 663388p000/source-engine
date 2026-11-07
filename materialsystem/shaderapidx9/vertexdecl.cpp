@@ -508,6 +508,27 @@ static bool VertexDeclLessFunc( const VertexDeclLookup_t &src1, const VertexDecl
 static CUtlRBTree<VertexDeclLookup_t, int> s_VertexDeclDict( 0, 256, VertexDeclLessFunc );
 
 //-----------------------------------------------------------------------------
+// Small direct-mapped cache in front of the red-black tree.
+// FindOrCreateVertexDecl runs for every draw call (CShaderAPIDx8::SetVertexDecl), and the tree lookup is a chain of dependent
+// loads and compares (log2 of the number of vertex formats in use). Consecutive draws nearly always use one of a handful of
+// formats, so a slot hit answers without touching the tree. An entry is a copy of a tree entry, so the cache can never disagree
+// with the tree as long as it is emptied whenever the tree is (ReleaseAllVertexDecl). mat_sapi_opt 0 bypasses it.
+// Same threading rule as the tree (which FindOrCreateVertexDecl already modifies): only the shader API thread calls in here.
+//-----------------------------------------------------------------------------
+extern ConVar mat_sapi_opt;
+
+enum { VERTEX_DECL_CACHE_BITS = 5, VERTEX_DECL_CACHE_SIZE = 1 << VERTEX_DECL_CACHE_BITS };
+static VertexDeclLookup_t s_VertexDeclCache[VERTEX_DECL_CACHE_SIZE];	// m_pDecl == NULL: empty slot
+
+static FORCEINLINE VertexDeclLookup_t *VertexDeclCacheSlot( VertexFormat_t fmt, int nFlags )
+{
+	// Multiplicative hash, the top bits are the well mixed ones.
+	uint64 h = ( uint64 )fmt * 0x9E3779B97F4A7C15ull;
+	h ^= ( ( uint64 )nFlags + 1 ) * 0xC2B2AE3D27D4EB4Full;
+	return &s_VertexDeclCache[ ( unsigned int )( h >> ( 64 - VERTEX_DECL_CACHE_BITS ) ) ];
+}
+
+//-----------------------------------------------------------------------------
 // Gets the declspec associated with a vertex format
 //-----------------------------------------------------------------------------
 IDirect3DVertexDeclaration9 *FindOrCreateVertexDecl( VertexFormat_t fmt, bool bStaticLit, bool bUsingFlex, bool bUsingMorph )
@@ -530,10 +551,24 @@ IDirect3DVertexDeclaration9 *FindOrCreateVertexDecl( VertexFormat_t fmt, bool bS
 		lookup.m_nFlags |= VertexDeclLookup_t::USING_FLEX;
 	}
 
+	VertexDeclLookup_t *pSlot = NULL;
+	if ( mat_sapi_opt.GetBool() )
+	{
+		pSlot = VertexDeclCacheSlot( fmt, lookup.m_nFlags );
+		if ( pSlot->m_pDecl && pSlot->m_VertexFormat == fmt && pSlot->m_nFlags == lookup.m_nFlags )
+		{
+			return pSlot->m_pDecl;
+		}
+	}
+
 	int i = s_VertexDeclDict.Find( lookup );
 	if ( i != s_VertexDeclDict.InvalidIndex() )
 	{
 		// found
+		if ( pSlot )
+		{
+			*pSlot = s_VertexDeclDict[i];
+		}
 		return s_VertexDeclDict[i].m_pDecl;
 	}
 
@@ -556,6 +591,10 @@ IDirect3DVertexDeclaration9 *FindOrCreateVertexDecl( VertexFormat_t fmt, bool bS
 	}
 
 	s_VertexDeclDict.Insert( lookup );
+	if ( pSlot )
+	{
+		*pSlot = lookup;
+	}
 	return lookup.m_pDecl;
 }
 
@@ -572,5 +611,10 @@ void ReleaseAllVertexDecl()
 			s_VertexDeclDict[i].m_pDecl->Release();
 		i = s_VertexDeclDict.NextInorder( i );
 	}
+
+	// The decls above are gone: forget them. Left in the tree they would be handed out again after the device is recreated
+	// (CShaderAPIDx8::SetMode -> OnDeviceShutdown, and a second call here would release them twice).
+	s_VertexDeclDict.RemoveAll();
+	memset( s_VertexDeclCache, 0, sizeof( s_VertexDeclCache ) );
 }
 
