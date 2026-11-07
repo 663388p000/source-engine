@@ -795,13 +795,13 @@ bool CShaderDeviceMgrDx8::ComputeCapsFromD3D( HardwareCaps_t *pCaps, int nAdapte
 
 	if ( pCaps->m_SupportsPixelShaders )
 	{
-		if ( pCaps->m_SupportsPixelShaders_2_0 )
+		if ( pCaps->m_SupportsShaderModel_3_0 )
 		{
-			pCaps->m_NumPixelShaderConstants = 32;
+			pCaps->m_NumPixelShaderConstants = 224;
 		}
 		else
 		{
-			pCaps->m_NumPixelShaderConstants = 8;
+			pCaps->m_NumPixelShaderConstants = 32;
 		}
 	}
 	else
@@ -881,6 +881,19 @@ bool CShaderDeviceMgrDx8::ComputeCapsFromD3D( HardwareCaps_t *pCaps, int nAdapte
 		
 		pCaps->m_MaxUserClipPlanes = 0;
 	}
+#if defined( TOGLES ) || defined( __ANDROID__ )
+	else if ( pCaps->m_MaxUserClipPlanes > 0 && !CommandLine()->CheckParm( "-useuserclipplanes" ) )
+	{
+		// Togles (ToGL on GLES) reports 2 user clip planes but cannot clip with them: GLES has no gl_ClipVertex, the plane equations
+		// never reach GL (the glClipPlane call in glmgr.h is compiled out) and the shader translator emits no clip output for them.
+		// The engine would therefore draw water reflection/refraction, mirror and portal passes with no clipping at all (wrong picture,
+		// and the passes shade every fragment of the unwanted side). Fast clipping is the stock Source path for hardware without clip
+		// planes: it moves the near plane onto the clip plane by editing the projection matrix, so it needs no shader support and no
+		// per-fragment work. It honours one plane at a time (the most recently pushed one, i.e. the water/mirror plane).
+		// -useuserclipplanes restores the old caps.
+		pCaps->m_MaxUserClipPlanes = 0;
+	}
+#endif
 
 	if ( pCaps->m_MaxUserClipPlanes > MAXUSERCLIPPLANES )
 	{
