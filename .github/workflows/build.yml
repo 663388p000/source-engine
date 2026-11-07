@@ -33,7 +33,7 @@ jobs:
           mkdir -p output/arm64-v8a
 
           libraries=(
-            libtogl.so
+            libshaderapidx9.so
           )
 
           for lib in "${libraries[@]}"; do
