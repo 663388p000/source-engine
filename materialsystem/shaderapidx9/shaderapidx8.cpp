@@ -124,6 +124,10 @@ ConVar mat_texture_limit( "mat_texture_limit", "-1", FCVAR_NEVER_AS_STRING,
 ConVar mat_frame_sync_enable( "mat_frame_sync_enable", "1", FCVAR_CHEAT );
 ConVar mat_frame_sync_force_texture( "mat_frame_sync_force_texture", "0", FCVAR_CHEAT, "Force frame syncing to lock a managed texture." );
 
+// Master switch for the CPU-side per-draw shortcuts in this module (vertex declaration cache in vertexdecl.cpp, the matrix constant
+// computation below). They give the same results as the original code; 0 runs the original code paths, for A/B comparison.
+ConVar mat_sapi_opt( "mat_sapi_opt", "1", 0, "Use the optimized per-draw code paths in shaderapidx9 (vertex declaration cache, matrix constants). 0 = original code." );
+
 
 #if defined( _X360 )
 ConVar mat_texturecachesize( "mat_texturecachesize", "176" );
@@ -630,6 +634,18 @@ public:
 		// Chain to the device
 		BaseClass::GetBackBufferDimensions( nWidth, nHeight );
 	}
+
+	// Get the current viewport
+	virtual void GetCurrentViewport( int& nX, int& nY, int& nWidth, int& nHeight ) const
+	{
+		ShaderViewport_t viewport;
+		ShaderAPI()->GetViewports( &viewport, 1 );
+		nX = viewport.m_nTopLeftX;
+		nY = viewport.m_nTopLeftY;
+		nWidth = viewport.m_nWidth;
+		nHeight = viewport.m_nHeight;
+	}
+
 	virtual void MarkUnusedVertexFields( unsigned int nFlags, int nTexCoordCount, bool *pUnusedTexCoords );
 
 public:
@@ -1342,6 +1358,18 @@ private:
 	void SetPixelShaderFogParams( int reg );
 	void SetPixelShaderFogParams( int reg, ShaderFogMode_t fogMode );
 
+	void SetVertexShaderCameraPos()
+	{
+		float vertexShaderCameraPos[4];
+		vertexShaderCameraPos[0] = m_WorldSpaceCameraPositon[0];
+		vertexShaderCameraPos[1] = m_WorldSpaceCameraPositon[1];
+		vertexShaderCameraPos[2] = m_WorldSpaceCameraPositon[2];
+		vertexShaderCameraPos[3] = m_DynamicState.m_FogZ;  //waterheight in water fog mode
+
+		// eyepos.x eyepos.y eyepos.z cWaterZ
+		SetVertexShaderConstantInternal( VERTEX_SHADER_CAMERA_POS, vertexShaderCameraPos );
+	}
+
 	FORCEINLINE void UpdateVertexShaderFogParams( void )
 	{
 		if ( g_pHardwareConfig->Caps().m_SupportsPixelShaders )
@@ -1364,17 +1392,9 @@ private:
 
 			fogParams[3] = ooFogRange;
 
-			float vertexShaderCameraPos[4];
-			vertexShaderCameraPos[0] = m_WorldSpaceCameraPositon[0];
-			vertexShaderCameraPos[1] = m_WorldSpaceCameraPositon[1];
-			vertexShaderCameraPos[2] = m_WorldSpaceCameraPositon[2];
-			vertexShaderCameraPos[3] = m_DynamicState.m_FogZ;  // waterheight
-
 			// cFogEndOverFogRange, cFogOne, unused, cOOFogRange
 			SetVertexShaderConstant( VERTEX_SHADER_FOG_PARAMS, fogParams, 1 );
-
-			// eyepos.x eyepos.y eyepos.z cWaterZ
-			SetVertexShaderConstant( VERTEX_SHADER_CAMERA_POS, vertexShaderCameraPos );
+			SetVertexShaderCameraPos();
 		}
 	}
 
@@ -10212,6 +10232,11 @@ void CShaderAPIDx8::PopMatrix()
 		m_pMatrixStack[m_CurrStack]->Pop();
 		UpdateMatrixTransform();
 	}
+	else
+	{
+		// Have to pop even while deactivated, otherwise the stack will overflow and we'll crash
+		m_pMatrixStack[m_CurrStack]->Pop();
+	}
 }
 
 void CShaderAPIDx8::LoadIdentity( )
@@ -10587,6 +10612,46 @@ static void printmat4x4( char *label, float *m00 )
 #endif
 }
 
+//-----------------------------------------------------------------------------
+// Matrix helpers for the vertex shader transform constants (used when mat_sapi_opt is on).
+// Every element is the same expression, with the same summation order, as in D3DXMatrixMultiply, so the results equal
+// D3DXMatrixMultiply (+ D3DXMatrixTranspose) element for element; they just skip the temporary copies and the second pass.
+// They are inline here because D3DXMatrixMultiply is an out-of-line call into the ToGL library.
+//-----------------------------------------------------------------------------
+static FORCEINLINE void MatrixMultiplyInline( D3DXMATRIX &out, const D3DXMATRIX &a, const D3DXMATRIX &b )
+{
+	// out must not alias a or b
+	for ( int i = 0; i < 4; i++ )
+	{
+		for ( int j = 0; j < 4; j++ )
+		{
+			out.m[i][j] =	( a.m[i][0] * b.m[0][j] ) + ( a.m[i][1] * b.m[1][j] ) + ( a.m[i][2] * b.m[2][j] ) + ( a.m[i][3] * b.m[3][j] );
+		}
+	}
+}
+
+// out = transpose( a * b )
+static FORCEINLINE void MatrixMultiplyTransposedInline( D3DXMATRIX &out, const D3DXMATRIX &a, const D3DXMATRIX &b )
+{
+	// out must not alias a or b
+	for ( int i = 0; i < 4; i++ )
+	{
+		for ( int j = 0; j < 4; j++ )
+		{
+			out.m[j][i] =	( a.m[i][0] * b.m[0][j] ) + ( a.m[i][1] * b.m[1][j] ) + ( a.m[i][2] * b.m[2][j] ) + ( a.m[i][3] * b.m[3][j] );
+		}
+	}
+}
+
+// pOut[0..3] = column 2 of ( a * b ), which is row 2 of transpose( a * b ): 4 dot products instead of a full multiply + transpose
+static FORCEINLINE void MatrixMultiplyColumn2Inline( float *pOut, const D3DXMATRIX &a, const D3DXMATRIX &b )
+{
+	for ( int i = 0; i < 4; i++ )
+	{
+		pOut[i] =	( a.m[i][0] * b.m[0][2] ) + ( a.m[i][1] * b.m[1][2] ) + ( a.m[i][2] * b.m[2][2] ) + ( a.m[i][3] * b.m[3][2] );
+	}
+}
+
 void CShaderAPIDx8::SetVertexShaderViewProj()
 {
 	//GLM_FUNC;
@@ -10594,6 +10659,32 @@ void CShaderAPIDx8::SetVertexShaderViewProj()
 	
 	if (g_pHardwareConfig->Caps().m_SupportsPixelShaders)
 	{
+		if ( mat_sapi_opt.GetBool() )
+		{
+			// Same constants as the code below, without the matrix copies and the repeated product: the projection that is used for
+			// the position (GetProjectionMatrix: fast clip / z-bias aware) and the plain one (for the "third row" that projPos.z
+			// style vertex shaders read) are the very same matrix unless fast clip or the z-bias projection is active.
+			const D3DXMATRIX &matView = GetTransform( MATERIAL_VIEW );
+			const D3DXMATRIX &matProj = GetProjectionMatrix();
+			const D3DXMATRIX &matProjPlain = GetTransform( MATERIAL_PROJECTION );
+
+			D3DXMATRIX viewProjT;
+			MatrixMultiplyTransposedInline( viewProjT, matView, matProj );
+			SetVertexShaderConstant( VERTEX_SHADER_VIEWPROJ, viewProjT, 4 );
+
+			if ( &matProj == &matProjPlain )
+			{
+				SetVertexShaderConstant( VERTEX_SHADER_VIEWPROJ_THIRD_ROW, &viewProjT.m[2][0], 1 );
+			}
+			else
+			{
+				float rowTwo[4];
+				MatrixMultiplyColumn2Inline( rowTwo, matView, matProjPlain );
+				SetVertexShaderConstant( VERTEX_SHADER_VIEWPROJ_THIRD_ROW, rowTwo, 1 );
+			}
+			return;
+		}
+
 		D3DXMATRIX transpose;
 		if(0)
 		{
@@ -10653,6 +10744,32 @@ void CShaderAPIDx8::SetVertexShaderModelViewProjAndModelView( void )
 	{
 		D3DXMATRIX modelView, transpose;
 		
+		if ( mat_sapi_opt.GetBool() )
+		{
+			// This runs for every draw whose model matrix changed. Same constants as the code below, with the redundant work
+			// removed: no matrix copies, the product is written transposed in one pass, and the "third row" product is only
+			// computed when it differs from the one just made (fast clip / z-bias projection) - and then only the one column
+			// that is used. Without those it is the same matrix, so the third row is simply taken from the result.
+			const D3DXMATRIX &matProj = GetProjectionMatrix();
+			const D3DXMATRIX &matProjPlain = GetTransform( MATERIAL_PROJECTION );
+
+			MatrixMultiplyInline( modelView, GetTransform( MATERIAL_MODEL ), GetTransform( MATERIAL_VIEW ) );
+			MatrixMultiplyTransposedInline( transpose, modelView, matProj );
+			SetVertexShaderConstant( VERTEX_SHADER_MODELVIEWPROJ, transpose, 4 );
+
+			if ( &matProj == &matProjPlain )
+			{
+				SetVertexShaderConstant( VERTEX_SHADER_MODELVIEWPROJ_THIRD_ROW, &transpose.m[2][0], 1 );
+			}
+			else
+			{
+				float rowTwo[4];
+				MatrixMultiplyColumn2Inline( rowTwo, modelView, matProjPlain );
+				SetVertexShaderConstant( VERTEX_SHADER_MODELVIEWPROJ_THIRD_ROW, rowTwo, 1 );
+			}
+			return;
+		}
+
 		if (0)
 		{
 			D3DXMatrixMultiply( &modelView, &GetTransform(MATERIAL_MODEL), &GetTransform(MATERIAL_VIEW) );
@@ -13207,7 +13324,8 @@ void CShaderAPIDx8::SetPSNearAndFarZ( int pshReg )
 	// m[2][2] =  F/(N-F)   (flip sign if RH)
 	// m[3][2] = NF/(N-F)
 
-	float vNearFar[4];
+	// all four components are uploaded (and compared against the cached constant): z/w must not be stack garbage
+	float vNearFar[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
 	float N =     m[3][2] / m[2][2];
 	float F = (m[3][2]*N) / (N + m[3][2]);
